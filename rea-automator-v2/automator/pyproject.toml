@@ -1,0 +1,23 @@
+[project]
+name = "rea-automator"
+version = "0.2.0"
+description = "Automatizador de análisis que llama a la CLI de rea (sin MCP)."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rea_automator*"]
+
+[tool.setuptools.package-data]
+# Clase de prueba (Hello.class + su fuente) que usa `check_jadx` para la prueba de humo.
+rea_automator = ["smoke/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
