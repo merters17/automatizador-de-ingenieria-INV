@@ -1,12 +1,9 @@
 """CLI del automatizador: `python -m rea_automator {route,analyze,batch,decompile,pipeline,
-setup-jadx,check-jadx,verify-jadx} ...`."""
-
+setup-jadx,check-jadx,verify-jadx,extract} ...`."""
 from __future__ import annotations
-
 import argparse
 import json
 import sys
-
 from .analyzer import analyze_target
 from .batch import run_batch
 from .config import ConfigError, load_settings
@@ -18,7 +15,7 @@ from .verify import verify_apk
 
 
 def _log(message: str) -> None:
-    """Mensajes de progreso de la preparación de JADX: a stderr, para no mezclarlos con el JSON."""
+    """Mensajes de progreso a stderr, para no mezclarlos con el JSON."""
     print(message, file=sys.stderr, flush=True)
 
 
@@ -48,6 +45,14 @@ def _build_parser() -> argparse.ArgumentParser:
     d.add_argument("--family", choices=FAMILIES, help="Fuerza la familia y omite el enrutamiento.")
     d.add_argument("--out", default="automator-results")
     d.add_argument("--timeout", type=float, default=None)
+    d.add_argument("--timeout-per-func", type=int, default=60, help="Timeout de decompilación por función (Ghidra).")
+    d.add_argument("--combined", action="store_true", help="Genera all_functions.c con todo el código (Ghidra).")
+    d.add_argument("--include", action="append", default=[], help="Solo exporta funciones cuyo nombre coincida con esta regex (Ghidra).")
+    d.add_argument("--exclude", action="append", default=[], help="Omite funciones cuyo nombre coincida con esta regex (Ghidra).")
+    d.add_argument("--resume", action="store_true", help="Reutiliza artefactos de una corrida previa si son válidos.")
+    d.add_argument("--force-export", action="store_true", help="Ignora cualquier salida previa y reconstruye todo.")
+    d.add_argument("--no-cache", action="store_true", help="No usa ni escribe caché de análisis Ghidra.")
+    d.add_argument("--cache-dir", default=None, help="Directorio personalizado para el caché de proyectos Ghidra.")
 
     pl = sub.add_parser(
         "pipeline",
@@ -90,6 +95,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="No descarga ni instala JADX: solo comprueba lo que haya en tool/jadx/.",
     )
     vj.add_argument("--jadx-zip", help="jadx-<versión>.zip local para instalar sin red (se verifica su SHA-256).")
+
+    ex = sub.add_parser(
+        "extract",
+        help="Extrae código fuente de un archivo (APK, .NET, Electron, nativo).",
+    )
+    ex.add_argument("target", help="Archivo a descompilar (APK, .exe/.dll, .asar, binario nativo).")
+    ex.add_argument("--out", default="extraccion", help="Carpeta de destino.")
     return p
 
 
@@ -119,10 +131,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(checked.to_dict(), ensure_ascii=False, indent=2))
         return 0 if checked.ok else 1
 
+    if args.cmd == "extract":
+        from .extract import main as extract_main
+        return extract_main([args.target, "--out", args.out])
+
     try:
         settings = load_settings(out_dir=args.out, timeout_s=args.timeout)
     except ConfigError as err:
-        # Configuración inválida: se informa con código 2 (uso incorrecto), sin traceback.
         print(f"error de configuración: {err}", file=sys.stderr)
         return 2
 
@@ -132,15 +147,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res.status == "ok" else 1
 
     if args.cmd == "decompile":
-        res = decompile_target(args.target, settings, family=args.family)
+        res = decompile_target(
+            args.target,
+            settings,
+            family=args.family,
+            timeout_per_func=args.timeout_per_func,
+            combined=args.combined,
+            include=tuple(args.include),
+            exclude=tuple(args.exclude),
+            resume=args.resume,
+            force_export=args.force_export,
+            cache_enabled=not args.no_cache,
+            cache_dir=args.cache_dir,
+        )
         print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
         return 0 if res.status in ("ok", "partial") else 1
 
     if args.cmd == "pipeline":
         res = run_pipeline(args.input, settings, keep_originals=not args.sin_originales)
         print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
-        # Los scripts que encadenan el CLI no deben interpretar un resultado
-        # parcial o saltado como éxito completo.
         return 0 if res.status == "ok" else 1
 
     if args.cmd == "verify-jadx":
@@ -152,7 +177,6 @@ def main(argv: list[str] | None = None) -> int:
             log=_log,
         )
         print(report.markdown)
-        # 0 solo si la prueba está APROBADA; el detalle (y los archivos) están en el informe.
         return 0 if report.passed else 1
 
     summary = run_batch(args.input_dir, settings)
@@ -164,7 +188,6 @@ def _entry() -> int:
     try:
         return main()
     except BrokenPipeError:
-        # La salida se cortó (p. ej. `| head`): no es un error del análisis.
         sys.stdout = open(__import__("os").devnull, "w")
         return 1
 

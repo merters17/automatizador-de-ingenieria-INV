@@ -1,20 +1,9 @@
-"""Orquesta la descompilación MASIVA: rutea -> ejecuta la herramienta de volcado
-completo correspondiente -> empaqueta todo el resultado en un .zip.
-
-Esto es deliberadamente distinto de `analyzer.analyze_target`:
-- `analyze_target` invoca `rea` y guarda evidencia dirigida (JSON) de lo que
-  `rea` decidió investigar.
-- `decompile_target` invoca la herramienta subyacente (jadx, ilspycmd, asar,
-  Ghidra headless) en su modo de volcado COMPLETO y entrega un .zip con todo
-  el árbol de código fuente resultante.
-
-No es un sustituto del automatizador original: es un segundo modo, para cuando
-lo que se necesita es "paso un archivo, me devuelve todo descompilado en un zip".
-"""
-
+"""Orquesta la descompilación MASIVA con soporte para artefactos por función,
+manifiesto estructurado, caché opcional de Ghidra y reanudación (resume)."""
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -26,20 +15,31 @@ from pathlib import Path
 from typing import Any
 
 try:
-    import fcntl  # POSIX. En Windows no existe: ahí la limpieza queda desactivada.
-except ImportError:  # pragma: no cover - depende de la plataforma
-    fcntl = None  # type: ignore[assignment]
+    import fcntl
+except ImportError:
+    fcntl = None
 
 from .adapters.bulk_native import build_ghidra_headless_argv
 from .adapters.bulk_tools import KIND_COPY_DIR, KIND_SUBPROCESS, build_bulk_plan
 from .config import Settings
+from .ghidra_cache import (
+    PROJECT_DIRNAME,
+    CacheOutcome,
+    default_cache_root,
+    discard_project,
+    entry_lock,
+    evaluate_entry,
+    mark_complete,
+    mark_incomplete,
+    resolved_versions,
+)
 from .routing import FAMILY_ANDROID, FAMILY_NATIVE, Route, RoutingError, route
 from .runner import CommandNotFoundError, run_bounded
 
 DECOMPILE_STATUSES = (
-    "ok",                # la herramienta terminó y se generó el zip
-    "partial",           # la herramienta terminó con código distinto de 0 pero sí escribió salida
-    "empty_output",      # la herramienta terminó "bien" pero no escribió ningún archivo
+    "ok",
+    "partial",
+    "empty_output",
     "timeout",
     "command_not_found",
     "routing_error",
@@ -62,29 +62,26 @@ class DecompileResult:
     run_dir: str | None = None
     error: Any = None
     unknowns: list[str] = field(default_factory=list)
-    # v2: datos medidos de la ejecución (hoy solo `details["jadx"]` para la familia Android).
     details: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def ok_ish(self) -> bool:
+        return self.status in ("ok", "partial") and self.file_count > 0
 
-# Códigos de salida de `jadx` según JadxCLI.java de la versión 1.5.6 (jadx-cli):
-#   0 -> `LOG.info("done")`
-#   1 -> argumentos inválidos (JadxArgsValidateException) o excepción no controlada
-#   2 -> `checkForErrors` devolvió true: con --no-res y sin clases que descompilar ("Load failed!")
-#   3 -> terminó de guardar y `errorsCount != 0` ("finished with errors, count: N")
+
 JADX_EXIT_MEANINGS = {
     0: "terminó sin errores",
     1: "argumentos inválidos o error de proceso",
     2: "no se cargó ninguna clase que descompilar (no guarda nada)",
     3: "terminó y guardó el código, pero con errores en algunas clases o métodos",
 }
+
 _JADX_ERRORS_RE = re.compile(r"finished with errors, count:\s*(\d+)")
 
 
 def _tail_text(path: Path, limit: int = 64 * 1024) -> str:
-    """Últimos `limit` bytes de un log como texto (el resumen de JADX está al final)."""
     try:
         with open(path, "rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -95,7 +92,6 @@ def _tail_text(path: Path, limit: int = 64 * 1024) -> str:
 
 
 def summarize_jadx_run(returncode: int | None, run_dir: Path, src_dir: Path) -> dict:
-    """Interpreta lo que JADX dejó: código de salida, nº de errores que informó y `.java` en disco."""
     errors: int | None = None
     for name in ("stdout.log", "stderr.log"):
         match = _JADX_ERRORS_RE.search(_tail_text(run_dir / name))
@@ -105,7 +101,7 @@ def summarize_jadx_run(returncode: int | None, run_dir: Path, src_dir: Path) -> 
     if returncode is None:
         meaning = "interrumpido por timeout"
     else:
-        meaning = JADX_EXIT_MEANINGS.get(returncode, "código no documentado en JadxCLI 1.5.6")
+        meaning = JADX_EXIT_MEANINGS.get(returncode, "código no documentado")
     return {
         "exit_code": returncode,
         "exit_meaning": meaning,
@@ -121,18 +117,10 @@ def _slug(path: Path) -> str:
 
 
 RUN_LOCK_NAME = ".lock"
-# Una ejecución solo puede borrarse si lleva más de este tiempo sin actividad Y
-# ningún proceso tiene su bloqueo. El tiempo protege la ventana entre mkdtemp y
-# la toma del bloqueo; el bloqueo protege a las ejecuciones activas.
 STALE_RUN_AGE_S = 24 * 3600
 
 
 def _lock_run_dir(run_dir: Path):
-    """Crea `.lock` en la carpeta de ejecución y toma un bloqueo exclusivo.
-
-    El bloqueo dura mientras el handle esté abierto (o hasta que el proceso
-    termine). Un proceso que intente limpiar esta carpeta no podrá tomarlo.
-    """
     handle = open(run_dir / RUN_LOCK_NAME, "w")
     if fcntl is not None:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -140,18 +128,6 @@ def _lock_run_dir(run_dir: Path):
 
 
 def cleanup_stale_runs(out_dir: Path, *, max_age_s: float = STALE_RUN_AGE_S) -> int:
-    """Borra ejecuciones antiguas que ya no están en uso. Devuelve cuántas borró.
-
-    Reglas, todas necesarias para borrar una carpeta:
-    - Es un directorio real (no un enlace) y contiene `.lock`: si no tiene ese
-      archivo no la creó este módulo, así que no se toca nunca.
-    - Su última modificación es anterior a `max_age_s`.
-    - Se puede tomar su bloqueo sin esperar. Si otro proceso la tiene en uso,
-      el intento falla con BlockingIOError y se deja intacta.
-
-    Sin `fcntl` (Windows) no hay forma de saber si una ejecución está activa,
-    así que no se borra nada.
-    """
     if fcntl is None or not out_dir.is_dir():
         return 0
     cutoff = time.time() - max_age_s
@@ -172,7 +148,7 @@ def cleanup_stale_runs(out_dir: Path, *, max_age_s: float = STALE_RUN_AGE_S) -> 
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                continue  # en uso por otro proceso: no tocar
+                continue
             shutil.rmtree(candidate, ignore_errors=True)
             removed += 1
         finally:
@@ -181,13 +157,6 @@ def cleanup_stale_runs(out_dir: Path, *, max_age_s: float = STALE_RUN_AGE_S) -> 
 
 
 def _create_run_dir(out_dir: Path, target_path: Path):
-    """Crea un directorio NUEVO y exclusivo para esta ejecución y lo bloquea.
-
-    Devuelve (run_dir, handle_del_bloqueo). Quien llame debe cerrar el handle
-    al terminar. La limpieza no toca nada que no haya creado este módulo, ni
-    ejecuciones activas, así que dos ejecuciones sobre el mismo objetivo ya no
-    pueden borrarse mutuamente.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     cleanup_stale_runs(out_dir)
     prefix = f"{_slug(target_path)}-"
@@ -196,16 +165,6 @@ def _create_run_dir(out_dir: Path, target_path: Path):
 
 
 def _read_ghidra_index(src_dir: Path) -> tuple[int, int, int] | None:
-    """Lee `_index.tsv` (escrito por ghidra_decompile_all.py) y cuenta cuántas
-    funciones terminaron "ok" contra el total. Devuelve (ok, fallidas, total),
-    o None si el índice no existe o no se puede interpretar: en ese caso no
-    hay forma de confirmar éxito y el llamador debe tratarlo con cautela, no
-    como un "ok" implícito.
-
-    No se confía en el código de salida del subproceso de Ghidra para esto:
-    el script puede terminar con código 0 (el host --analyzeHeadless-- no se
-    cayó) aun cuando varias o todas las funciones individuales fallaron.
-    """
     index_path = src_dir / "_index.tsv"
     if not index_path.is_file():
         return None
@@ -215,7 +174,7 @@ def _read_ghidra_index(src_dir: Path) -> tuple[int, int, int] | None:
         return None
     if not lines:
         return None
-    rows = lines[1:]  # saltar encabezado "address\tname\tstatus\tfile"
+    rows = lines[1:]
     ok_count = 0
     fail_count = 0
     for row in rows:
@@ -227,19 +186,22 @@ def _read_ghidra_index(src_dir: Path) -> tuple[int, int, int] | None:
         status = fields[2]
         if status == "ok":
             ok_count += 1
-        else:  # "failed" o "exception"
+        else:
             fail_count += 1
     return ok_count, fail_count, ok_count + fail_count
 
 
-def _copy_tree_no_symlinks(src: Path, dst: Path) -> tuple[int, int]:
-    """Copia `src` a `dst` sin seguir enlaces simbólicos.
+def _read_ghidra_manifest(src_dir: Path) -> dict | None:
+    manifest_path = src_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
 
-    `shutil.copytree` sigue symlinks por defecto, así que un enlace dentro de la
-    carpeta podía meter en el zip de salida contenido de fuera de ella. Aquí los
-    enlaces (a archivo o a directorio) se omiten, igual que en el pipeline.
-    Devuelve (archivos copiados, enlaces omitidos).
-    """
+
+def _copy_tree_no_symlinks(src: Path, dst: Path) -> tuple[int, int]:
     copied = 0
     skipped = 0
     for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
@@ -257,7 +219,6 @@ def _copy_tree_no_symlinks(src: Path, dst: Path) -> tuple[int, int]:
 
 
 def _zip_dir(src_dir: Path, zip_path: Path) -> int:
-    """Comprime src_dir completo en zip_path. Devuelve cuántos archivos entraron."""
     count = 0
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -268,14 +229,148 @@ def _zip_dir(src_dir: Path, zip_path: Path) -> int:
     return count
 
 
+# ============================ RESUME HELPERS ============================
+
+def _find_previous_run(out_dir: Path, slug: str) -> Path | None:
+    """Busca el directorio de ejecución previa más reciente para un target."""
+    if not out_dir.is_dir():
+        return None
+    candidates = []
+    for child in out_dir.iterdir():
+        if not child.is_dir() or child.is_symlink():
+            continue
+        if not child.name.startswith(f"{slug}-"):
+            continue
+        manifest = child / "manifest.json"
+        if manifest.is_file():
+            candidates.append(child)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _artifact_hashes_match(previous_dir: Path, record: dict) -> bool:
+    artifacts = record.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return False
+    for path_key, hash_key in (
+        ("pseudocode", "pseudocode_sha256"),
+        ("assembly", "assembly_sha256"),
+        ("sidecar", "sidecar_sha256"),
+    ):
+        relative = artifacts.get(path_key)
+        expected = artifacts.get(hash_key)
+        if not isinstance(relative, str) or not isinstance(expected, str):
+            return False
+        path = previous_dir / relative
+        if not path.resolve().is_relative_to(previous_dir.resolve()):
+            return False
+        if not path.is_file():
+            return False
+        try:
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return False
+        if actual != expected:
+            return False
+    return True
+
+
+def load_resume_index(
+    previous_dir: Path,
+    filters: dict | None = None,
+) -> dict[str, dict]:
+    """Devuelve stem -> record para funciones reutilizables de una corrida previa."""
+    try:
+        manifest = json.loads((previous_dir / "manifest.json").read_text(encoding="utf-8"))
+        records = manifest.get("functions", [])
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+    if not isinstance(manifest, dict) or manifest.get("status") != "complete":
+        return {}
+    if not isinstance(records, list):
+        return {}
+
+    include = filters.get("include") or ()
+    exclude = filters.get("exclude") or ()
+    if include or exclude:
+        include_re = [re.compile(p) for p in include]
+        exclude_re = [re.compile(p) for p in exclude]
+
+        def name_ok(name: str) -> bool:
+            if include_re and not any(p.search(name) for p in include_re):
+                return False
+            return not any(p.search(name) for p in exclude_re)
+
+        records = [r for r in records if name_ok(r.get("name", ""))]
+
+    reusable: dict[str, dict] = {}
+    for record in records:
+        if not isinstance(record, dict) or "address" not in record:
+            continue
+        if record.get("decompilation", {}).get("status") not in ("ok", "success"):
+            continue
+        if not _artifact_hashes_match(previous_dir, record):
+            continue
+        stem = record.get("artifacts", {}).get("pseudocode")
+        if not stem:
+            address = record.get("address", "")
+            name = record.get("name", "")
+            stem = _artifact_stem(address, name)
+        reusable[stem] = record
+
+    return reusable
+
+
+def _artifact_stem(address: str, name: str, max_length: int = 120) -> str:
+    digest = hashlib.sha256(f"{address}\0{name}".encode()).hexdigest()[:24]
+    safe_address = re.sub(r"[^A-Za-z0-9._-]", "_", address)[:40] or "_"
+    name_limit = max(1, max_length - len(safe_address) - len(digest) - 2)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:name_limit] or "_"
+    return f"{safe_address}_{digest}_{safe_name}"
+
+
+def _copy_reusable_artifacts(
+    previous_dir: Path,
+    new_dir: Path,
+    reusable: dict[str, dict],
+) -> list[str]:
+    """Copia .c / .s / .json de funciones reutilizadas al nuevo directorio."""
+    copied = []
+    for stem, record in reusable.items():
+        artifacts = record.get("artifacts", {})
+        for key in ("pseudocode", "assembly", "sidecar"):
+            rel = artifacts.get(key)
+            if not rel:
+                continue
+            src = previous_dir / rel
+            dst = new_dir / rel
+            if src.is_file():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                copied.append(stem)
+                break
+    return copied
+
+
+# ============================ MAIN ENTRY ============================
+
 def decompile_target(
     target: str | Path,
     settings: Settings,
     *,
     family: str | None = None,
+    timeout_per_func: int = 60,
+    combined: bool = False,
+    include: tuple[str, ...] = (),
+    exclude: tuple[str, ...] = (),
+    resume: bool = False,
+    force_export: bool = False,
+    cache_enabled: bool = True,
+    cache_dir: str | Path | None = None,
 ) -> DecompileResult:
     target_path = Path(target)
-
     if not target_path.exists():
         result = DecompileResult(target=str(target_path), status="not_found")
         result.unknowns.append("target_missing")
@@ -283,7 +378,20 @@ def decompile_target(
 
     run_dir, lock = _create_run_dir(settings.out_dir, target_path)
     try:
-        return _decompile_in_run_dir(target_path, settings, run_dir, family)
+        return _decompile_in_run_dir(
+            target_path,
+            settings,
+            run_dir,
+            family,
+            timeout_per_func=timeout_per_func,
+            combined=combined,
+            include=include,
+            exclude=exclude,
+            resume=resume,
+            force_export=force_export,
+            cache_enabled=cache_enabled,
+            cache_dir=cache_dir,
+        )
     finally:
         lock.close()
 
@@ -293,22 +401,23 @@ def _decompile_in_run_dir(
     settings: Settings,
     run_dir: Path,
     family: str | None,
+    *,
+    timeout_per_func: int,
+    combined: bool,
+    include: tuple[str, ...],
+    exclude: tuple[str, ...],
+    resume: bool,
+    force_export: bool,
+    cache_enabled: bool,
+    cache_dir: str | Path | None,
 ) -> DecompileResult:
     result = DecompileResult(target=str(target_path), status="failed")
-
-    # Directorio de trabajo único para ESTA ejecución (creado y bloqueado por
-    # _create_run_dir): nunca existió antes, así que no puede traer contenido
-    # de una corrida anterior.
     result.run_dir = str(run_dir)
     src_dir = run_dir / "decompiled"
     zip_path = run_dir / "decompiled.zip"
-
-    # Con un run_dir recién creado (nombre aleatorio) esto ya no puede pasar en
-    # la práctica, pero se mantiene como resguardo barato: si el target fuera
-    # el propio run_dir o algo dentro de él, el copy_dir de más abajo podría
-    # entrar en recursión sobre su propio destino.
     resolved_target = target_path.resolve()
     resolved_run_dir = run_dir.resolve()
+
     try:
         resolved_target.relative_to(resolved_run_dir)
     except ValueError:
@@ -331,15 +440,78 @@ def _decompile_in_run_dir(
             result.unknowns.append(f"routing:{err.code}")
             return result
         family = chosen.family
-    result.family = family
 
+    result.family = family
     src_dir.mkdir(parents=True, exist_ok=True)
+
+    # ============================ RESUME LOGIC ============================
+    reusable_stems: list[str] = []
+    resume_info: dict[str, Any] = {"enabled": resume, "reused": 0, "pending": 0}
+
+    if family == FAMILY_NATIVE and resume and not force_export:
+        prev_dir = _find_previous_run(settings.out_dir, _slug(target_path))
+        if prev_dir is not None:
+            filters = {"include": list(include), "exclude": list(exclude)}
+            reusable = load_resume_index(prev_dir, filters=filters)
+            if reusable:
+                reusable_stems = _copy_reusable_artifacts(prev_dir, src_dir, reusable)
+                resume_info["reused"] = len(reusable_stems)
+
+    pending_exclude = tuple(exclude) + tuple(reusable_stems)
 
     if family == FAMILY_NATIVE:
         project_dir = run_dir / "ghidra_project"
         project_dir.mkdir(parents=True, exist_ok=True)
+
+        cache_outcome: CacheOutcome | None = None
+        project_location = project_dir
+
+        if cache_enabled:
+            root = (Path(cache_dir) if cache_dir else default_cache_root()).expanduser().resolve()
+            fingerprint = {
+                "schema_version": 1,
+                "input": {
+                    "path": str(resolved_target),
+                    "sha256": hashlib.sha256(resolved_target.read_bytes()).hexdigest(),
+                    "size": resolved_target.stat().st_size,
+                },
+                "analysis": {
+                    "timeout_per_func": timeout_per_func,
+                    "combined": combined,
+                    "include": list(include),
+                    "exclude": list(exclude),
+                },
+            }
+            key = fingerprint["sha256"] if "sha256" in fingerprint else None
+            if key is None:
+                from .ghidra_cache import cache_key as _cache_key
+                key = _cache_key(fingerprint, fingerprint["analysis"])
+            entry = root / key
+            versions = resolved_versions(
+                ghidra_version="unknown",
+                pyghidra_version="unknown",
+                exporter_version="0.2.1",
+            )
+            with entry_lock(entry):
+                hit, reason = evaluate_entry(entry, fingerprint, versions)
+                if force_export:
+                    discard_project(root, entry)
+                    hit, reason = False, "reanalysis forced"
+                if not hit:
+                    mark_incomplete(entry, fingerprint)
+                cache_outcome = CacheOutcome(True, hit, entry, reason)
+            if hit:
+                project_location = entry / PROJECT_DIRNAME
+
         argv = build_ghidra_headless_argv(
-            settings, target_path, src_dir, project_dir=project_dir
+            settings,
+            target_path,
+            src_dir,
+            project_dir=project_location,
+            timeout_per_func=timeout_per_func,
+            combined=combined,
+            include=include,
+            exclude=pending_exclude,
         )
     else:
         plan = build_bulk_plan(settings, family, target_path, src_dir)
@@ -352,6 +524,7 @@ def _decompile_in_run_dir(
             result.file_count = file_count
             result.zip_path = str(zip_path) if file_count else None
             result.out_dir = str(src_dir)
+            result.details["resume"] = resume_info
             return result
         argv = plan.argv
 
@@ -372,15 +545,13 @@ def _decompile_in_run_dir(
         if family == FAMILY_ANDROID:
             result.error["hint"] = "JADX no está preparado en esa ruta. Ejecuta: python -m rea_automator setup-jadx"
         result.unknowns.append("command_not_found")
+        result.details["resume"] = resume_info
         return result
 
     result.exit_code = raw.returncode
     result.duration_s = raw.duration_s
 
     if family == FAMILY_ANDROID:
-        # Lo medido de esta ejecución de JADX (no se deduce: sale del código de salida, del
-        # log y de los archivos que quedaron en disco). Si JADX informó errores, queda
-        # también como "desconocido" para que el estado `partial` tenga una razón visible.
         result.details["jadx"] = summarize_jadx_run(raw.returncode, run_dir, src_dir)
         if result.details["jadx"]["errors"] is not None:
             result.unknowns.append(f"jadx_errors:{result.details['jadx']['errors']}")
@@ -388,12 +559,12 @@ def _decompile_in_run_dir(
     if raw.timed_out:
         result.status = "timeout"
         result.unknowns.append("timeout_killed")
-        # Empaquetar lo que se alcanzó a descompilar antes del timeout, si algo hay.
         file_count = _zip_dir(src_dir, zip_path)
         if file_count:
             result.file_count = file_count
             result.zip_path = str(zip_path)
             result.out_dir = str(src_dir)
+        result.details["resume"] = resume_info
         return result
 
     file_count = _zip_dir(src_dir, zip_path)
@@ -403,6 +574,7 @@ def _decompile_in_run_dir(
     if file_count == 0:
         result.status = "empty_output"
         result.unknowns.append("no_files_written")
+        result.details["resume"] = resume_info
         return result
 
     result.zip_path = str(zip_path)
@@ -410,25 +582,74 @@ def _decompile_in_run_dir(
     if raw.returncode != 0:
         result.unknowns.append(f"tool_exit_code:{raw.returncode}")
 
+    if (
+        family == FAMILY_NATIVE
+        and cache_enabled
+        and cache_outcome is not None
+        and cache_outcome.path is not None
+        and not cache_outcome.hit
+    ):
+        analysis_summary = {
+            "status": result.status,
+            "file_count": file_count,
+            "reused": resume_info["reused"],
+        }
+        mark_complete(
+            cache_outcome.path,
+            {
+                "schema_version": 1,
+                "input": {
+                    "path": str(resolved_target),
+                    "sha256": hashlib.sha256(resolved_target.read_bytes()).hexdigest(),
+                    "size": resolved_target.stat().st_size,
+                },
+                "analysis": {
+                    "timeout_per_func": timeout_per_func,
+                    "combined": combined,
+                    "include": list(include),
+                    "exclude": list(exclude),
+                },
+            },
+            resolved_versions(
+                ghidra_version="unknown",
+                pyghidra_version="unknown",
+                exporter_version="0.2.1",
+            ),
+            analysis_summary,
+        )
+
     if family == FAMILY_NATIVE:
-        # Ghidra puede terminar con código 0 aunque varias (o todas) las
-        # funciones individuales hayan fallado al descompilar: la presencia
-        # de archivos .c (uno por función, incluso las fallidas, con un
-        # comentario de error adentro) no es evidencia de éxito. Se analiza
-        # _index.tsv -- el resultado real por función -- para corregir el
-        # estado en vez de confiar solo en el código de salida del proceso.
         index = _read_ghidra_index(src_dir)
-        if index is None:
-            # No se pudo confirmar nada: no declarar "ok" a ciegas.
+        manifest = _read_ghidra_manifest(src_dir)
+        if manifest is not None:
+            counts = manifest.get("counts", {})
+            result.details["ghidra_manifest"] = {
+                "language_id": manifest.get("language_id"),
+                "compiler_id": manifest.get("compiler_id"),
+                "image_base": manifest.get("image_base"),
+                "counts": counts,
+            }
+            if isinstance(counts, dict):
+                manifest_file_count = (
+                    counts.get("successful", 0)
+                    + counts.get("fallback", 0)
+                    + counts.get("failed", 0)
+                )
+                if manifest_file_count:
+                    result.file_count = manifest_file_count
+        if index is None and manifest is None:
             if result.status == "ok":
                 result.status = "partial"
             result.unknowns.append("ghidra_index_missing")
         else:
-            ok_count, fail_count, total = index
-            if fail_count > 0:
-                result.unknowns.append(f"ghidra_function_failures:{fail_count}/{total}")
-                if ok_count == 0:
-                    result.status = "failed"
-                elif result.status == "ok":
-                    result.status = "partial"
+            if index is not None:
+                ok_count, fail_count, total = index
+                if fail_count > 0:
+                    result.unknowns.append(f"ghidra_function_failures:{fail_count}/{total}")
+                    if ok_count == 0:
+                        result.status = "failed"
+                    elif result.status == "ok":
+                        result.status = "partial"
+
+    result.details["resume"] = resume_info
     return result

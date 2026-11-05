@@ -15,3 +15,14 @@ Añadido en la v2 (JADX preparado y comprobado dentro del proyecto):
 """
 
 __version__ = "0.2.0"
+
+
+"""Automatizador de análisis que llama a la CLI de rea (sin MCP).
+...
+Añadido en la v2.1 (Ghidra mejorado):
+  ghidra_decompile_all.py genera artefactos por función (.c, .s, .json) + manifest.json.
+  ghidra_artifacts.py escritura atómica y publicación segura de directorios.
+  ghidra_cache.py caché indexado por huella dactilar del binario y la solicitud.
+  logger.py / string_util.py utilidades de logging y extracción de strings.
+"""
+__version__ = "0.2.1"
