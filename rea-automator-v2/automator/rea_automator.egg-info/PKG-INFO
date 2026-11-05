@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: rea-automator
+Version: 0.2.0
+Summary: Automatizador de análisis que llama a la CLI de rea (sin MCP).
+Requires-Python: >=3.10
+Provides-Extra: test
+Requires-Dist: pytest>=8; extra == "test"
